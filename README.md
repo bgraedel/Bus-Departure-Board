@@ -1,4 +1,8 @@
 # Live Departure Board 
+
+This is a fork from https://jonathanfoot.com/Projects/DepartureBoard/ with the goal to adapt it to the open journey planner api from [opentrdansportdata](https://opentrdansportdata.swiss/de/).
+Should in theory work with any type of Stop in Switzerland.
+
 ### Bus Departure Board for any UK Bus Stop
 ![Bus Demostartion Display](https://jonathanfoot.com/assets/DemoDisplay.gif)
 
