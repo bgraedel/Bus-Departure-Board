@@ -411,7 +411,7 @@ class TextImage:
     def __init__(self, device, text):
         self.device = device
         self.text = text
-        self.ImageBus = Image.open("bus.png").resize((16, 16))
+        self.ImageBus = Image.open("resources/bus.png").resize((16, 16))
         self.ImageBlank = Image.new(device.mode, (16, 16), (0, 0, 0))
         self.image = None
         self.width = 0
@@ -492,7 +492,7 @@ class StaticTextImage:
         # --- Draw the *new* service (on the lower half: y=16) ---
         if service.ServiceNumber in ["<Bus>", "<Bus> blinking"]:
             # Draw bus icon
-            bus_img = Image.open("bus.png").resize((16, 16))
+            bus_img = Image.open("resources/bus.png").resize((16, 16))
             # (x=0, y=16) is where you used to draw text for the new service number
             self.image.paste(bus_img, (0, 16), bus_img)
         else:
