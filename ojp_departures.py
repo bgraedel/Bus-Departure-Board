@@ -1426,7 +1426,7 @@ async def main():
     # Show splash once at startup
     Splash(device)
 
-    # Start your blink thread
+    # Start blink thread
     BlinkState.start()
 
     board = boardFixed(image_composition, Args.Delay, device)
