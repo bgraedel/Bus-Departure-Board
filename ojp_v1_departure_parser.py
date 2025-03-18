@@ -55,7 +55,7 @@ class LocationRequestBuilder:
         # Add timestamp in ISO format with Z
         now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         ET.SubElement(service_request, "RequestTimestamp").text = now
-        ET.SubElement(service_request, "RequestorRef").text = "API-Explorer"
+        ET.SubElement(service_request, "RequestorRef").text = "departure_board"
 
         location_request = ET.SubElement(service_request, "ojp:OJPLocationInformationRequest")
         ET.SubElement(location_request, "RequestTimestamp").text = now
