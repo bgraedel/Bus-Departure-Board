@@ -1113,75 +1113,90 @@ class boardFixed:
     async def update_display_with_new_data(self):
         """
         Updates the display with new data while trying to preserve the current view state.
+        Minimizes lock contention by performing calculations outside critical sections.
         """
-        async with self.display_lock:
-            # If this is the first time, do a full initialization
-            if self.top is None:
+        # If this is the first time, do a full initialization
+        if self.top is None:
+            async with self.display_lock:
                 self.set_initial_cards()
-                return
+            return
 
-            # Get the pinned and rotating services
-            async with self.services_lock:
-                pinned, rotating = self.split_pinned_rotating()
+        # Get data with minimal lock time
+        current_visible_ids = []
+        current_middle_id = None
+        
+        async with self.services_lock:
+            pinned, rotating = self.split_pinned_rotating()
+            # Quickly gather the current state
+            if self.top and self.top.CurrentService.ID != "0":
+                current_visible_ids.append(self.top.CurrentService.ID)
+            if self.middle and self.middle.CurrentService.ID != "0":
+                current_visible_ids.append(self.middle.CurrentService.ID)
+                current_middle_id = self.middle.CurrentService.ID
+            if self.bottom and self.bottom.CurrentService.ID != "0":
+                current_visible_ids.append(self.bottom.CurrentService.ID)
 
-                # Get currently visible services for continuity
-                visible_services = []
-                if self.top and self.top.CurrentService.ID != "0":
-                    visible_services.append(self.top.CurrentService.ID)
-                if self.middle and self.middle.CurrentService.ID != "0":
-                    visible_services.append(self.middle.CurrentService.ID)
-                if self.bottom and self.bottom.CurrentService.ID != "0":
-                    visible_services.append(self.bottom.CurrentService.ID)
+        # Calculate new states outside of locks
+        next_top = None
+        next_middle = None
+        next_bottom = None
+        new_rotating_index = self.rotating_index
 
-                # Update top row (always shows the earliest service if FixToArrive is True)
-                if Args.FixToArrive:
-                    if pinned:
-                        # If the pinned service is different from what's currently shown, update it
-                        if not self.top or self.top.CurrentService.ID != pinned.ID:
-                            self.top.changeCard(pinned)
+        # Determine top row update (pinned service)
+        if Args.FixToArrive and pinned and (not self.top or self.top.CurrentService.ID != pinned.ID):
+            next_top = pinned
+        elif Args.FixToArrive and not pinned:
+            next_top = LiveTimeStud()
+
+        # Calculate middle and bottom row updates (rotating services)
+        if len(rotating) > 0:
+            # Try to find the current middle service in the new rotating list
+            current_middle_idx = -1
+            if current_middle_id != "0":
+                for i, svc in enumerate(rotating):
+                    if svc.ID == current_middle_id:
+                        current_middle_idx = i
+                        break
+                        
+            if current_middle_idx >= 0:
+                # Found the current middle service - keep the same position
+                new_rotating_index = current_middle_idx
+            elif len(current_visible_ids) > 0:
+                # Current service not found, try to find any visible service
+                for vis_id in current_visible_ids:
+                    for i, svc in enumerate(rotating):
+                        if svc.ID == vis_id:
+                            new_rotating_index = i
+                            break
                     else:
-                        self.top.changeCard(LiveTimeStud())
+                        continue
+                    break
 
-                # For rotating services, try to maintain the current view by finding where
-                # the currently displayed services are in the new list
-                if len(rotating) > 0:
-                    # Try to find the current middle service in the new rotating list
-                    current_middle_idx = -1
-                    if self.middle and self.middle.CurrentService.ID != "0":
-                        for i, svc in enumerate(rotating):
-                            if svc.ID == self.middle.CurrentService.ID:
-                                current_middle_idx = i
-                                break
+            # Determine the indices for middle and bottom rows
+            idx_middle = new_rotating_index % len(rotating)
+            idx_bottom = (new_rotating_index + 1) % len(rotating) if len(rotating) > 1 else -1
+            
+            # Prepare the new services to display
+            next_middle = rotating[idx_middle]
+            next_bottom = rotating[idx_bottom] if idx_bottom >= 0 else LiveTimeStud()
+        else:
+            # No rotating services available
+            next_middle = LiveTimeStud()
+            next_bottom = LiveTimeStud()
 
-                    if current_middle_idx >= 0:
-                        # Found the current middle service - keep the same position
-                        self.rotating_index = current_middle_idx
-                    elif len(visible_services) > 0:
-                        # Current service not found, but try to find any of the currently
-                        # visible services in the new list
-                        for vis_id in visible_services:
-                            for i, svc in enumerate(rotating):
-                                if svc.ID == vis_id:
-                                    self.rotating_index = i
-                                    break
-
-                    # Update middle and bottom rows based on the determined rotating_index
-                    idx_middle = self.rotating_index % len(rotating)
-                    idx_bottom = (
-                        (self.rotating_index + 1) % len(rotating)
-                        if len(rotating) > 1
-                        else -1
-                    )
-
-                    self.middle.changeCard(rotating[idx_middle])
-                    if idx_bottom >= 0:
-                        self.bottom.changeCard(rotating[idx_bottom])
-                    else:
-                        self.bottom.changeCard(LiveTimeStud())
-                else:
-                    # No rotating services available
-                    self.middle.changeCard(LiveTimeStud())
-                    self.bottom.changeCard(LiveTimeStud())
+        # Now apply the updates with minimal lock time
+        async with self.display_lock:
+            # Only update the rotating index if we're actually changing it
+            if new_rotating_index != self.rotating_index:
+                self.rotating_index = new_rotating_index
+                
+            # Only apply changes where needed
+            if next_top:
+                self.top.changeCard(next_top)
+            if next_middle and (not self.middle or self.middle.CurrentService.ID != next_middle.ID):
+                self.middle.changeCard(next_middle)
+            if next_bottom and (not self.bottom or self.bottom.CurrentService.ID != next_bottom.ID):
+                self.bottom.changeCard(next_bottom)
 
     async def tick(self):
         """
@@ -1372,6 +1387,21 @@ async def display(board, device, image_composition, FontTime):
         )
 
 
+async def fetch_data_periodically(board):
+    """
+    Runs in the background, fetching new data every X seconds without blocking rendering.
+    """
+    while True:
+        await asyncio.sleep(Args.RequestLimit)  # Wait before fetching again
+        try:
+            changed = await board.fetch_and_sort_services()  # Get new data
+
+            if changed:  # Only update if there's new data
+                await board.update_display_with_new_data()
+        except Exception as e:
+            print(f"Error fetching new data: {e}")
+
+
 async def main():
     # Create the display device
     DisplayParser = cmdline.create_parser(
@@ -1391,7 +1421,7 @@ async def main():
             ]
         )
     )
-    
+
     # Configure GIF output if using gifanim emulator
     if Args.Display == "gifanim":
         device._filename = str(Args.filename)
@@ -1421,21 +1451,22 @@ async def main():
     board = boardFixed(image_composition, Args.Delay, device)
     await board.first_fetch()  # Fetch initial data
 
+    # === New: Start Background Data Fetching ===
+    fetch_task = asyncio.create_task(fetch_data_periodically(board))
+
+    # === New Frame Timing Setup ===
+    target_fps = 50  # Set target FPS
+    frame_time = 1 / target_fps  # Target time per frame
+
     try:
         while True:
-            # Handle device state (if the board has crashed or stopped updating)
-            if board.State == "dead":
-                del board
-                board = boardFixed(image_composition, Args.Delay, device)
-                device.clear()
-                await board.fetch_and_sort_services()
-                board.set_initial_cards()
+            start_time = asyncio.get_event_loop().time()  # Time before execution
 
-            # Handle energy saver mode (dim/off)
+            # Handle energy saver mode
             if Args.EnergySaverMode != "none" and is_time_between():
                 if Args.EnergySaverMode == "dim":
                     if energyMode == "normal":
-                        device.contrast(15)  # Lower brightness
+                        device.contrast(15)
                         energyMode = "dim"
                     await display(board, device, image_composition, FontTime)
                 elif Args.EnergySaverMode == "off":
@@ -1444,29 +1475,32 @@ async def main():
                         device.hide()
                         energyMode = "off"
             else:
-                # Normal mode
                 if energyMode != "normal":
                     device.contrast(255)
                     if energyMode == "off":
                         device.show()
-                        Splash(device)  # Optional re-splash
+                        Splash(device)
                         board = boardFixed(image_composition, Args.Delay, device)
                         await board.first_fetch()
                     energyMode = "normal"
 
-                # Use asyncio.gather to prevent sequential blocking
-                tasks = [
-                    asyncio.create_task(board.tick()),
-                    asyncio.create_task(display(board, device, image_composition, FontTime))
-                ]
-                await asyncio.gather(*tasks)  # Run tasks concurrently
+                # Core UI updates
+                await asyncio.gather(
+                    board.tick(),  # Animation updates
+                    display(board, device, image_composition, FontTime)  # UI rendering
+                )
 
-            await asyncio.sleep(0.02)  # Non-blocking delay
+            # === New Dynamic Timing Mechanism ===
+            elapsed_time = asyncio.get_event_loop().time() - start_time
+            sleep_time = max(0, frame_time - elapsed_time)
+
+            await asyncio.sleep(sleep_time)
 
     except KeyboardInterrupt:
         print("Shutting down...")
-        BlinkState.stop()  # Stop blinking on Ctrl+C
+        BlinkState.stop()  # Stop blinking
         blink_task.cancel()  # Cancel blink task
+        fetch_task.cancel()  # Stop background fetching
         device.clear()
         device.hide()
         device.cleanup()
