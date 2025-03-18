@@ -606,53 +606,35 @@ class Synchroniser:
 
 class BlinkState:
     """
-    A class that toggles its internal blink state every X seconds in a background thread.
-    Now with thread safety.
+    Handles a global blink state in an async coroutine instead of a separate thread.
     """
-
     _blink_visible = False
-    _interval = 1.0
-    _stop_event = threading.Event()
-    _lock = threading.Lock()  # Add a lock for thread safety
+    _interval = 0.5  # Blinking interval
+    _running = True  # Flag to stop blinking
 
     @classmethod
-    def start(cls, interval: float = 1.0):
+    async def start(cls):
         """
-        Begin blinking in the background, toggling every 'interval' seconds.
+        Runs the blinking logic asynchronously.
         """
-        cls._interval = interval
-        # Make sure the stop event isn't set from any previous run
-        cls._stop_event.clear()
-        # Start background thread
-        thread = threading.Thread(target=cls._run, daemon=True)
-        thread.start()
+        while cls._running:
+            cls._blink_visible = not cls._blink_visible
+            await asyncio.sleep(cls._interval)  # Non-blocking delay
 
     @classmethod
-    def _run(cls):
+    def is_visible(cls):
         """
-        The worker method that runs in the background, flipping _blink_visible.
-        Now thread-safe.
+        Returns the current visibility state.
         """
-        while not cls._stop_event.is_set():
-            time.sleep(cls._interval)
-            with cls._lock:
-                cls._blink_visible = not cls._blink_visible
-
-    @classmethod
-    def is_visible(cls) -> bool:
-        """
-        Returns whether the blink state is currently "visible".
-        Now thread-safe.
-        """
-        with cls._lock:
-            return cls._blink_visible
+        return cls._blink_visible
 
     @classmethod
     def stop(cls):
         """
-        Stop the blink thread (for cleanup).
+        Stops the blinking loop.
         """
-        cls._stop_event.set()
+        cls._running = False
+
 
 
 class ScrollTime:
@@ -811,7 +793,7 @@ class ScrollTime:
         self._safe_remove_image(self.IDestination)
         self._safe_remove_image(self.IServiceNumber)
         self._safe_remove_image(self.IDisplayTime)
-        self.image_composition.refresh()
+        self.image_composition.refresh()  # Force refresh to clear memory
 
     #
     # ────────────────── ASYNC TICK ──────────────────
@@ -933,17 +915,15 @@ class ScrollTime:
             self.IStaticOld.offset = (0, self.image_y_posA)
 
     def refresh(self):
-        if (
-            hasattr(self, "IDestination")
-            and hasattr(self, "IServiceNumber")
-            and hasattr(self, "IDisplayTime")
-        ):
-            self._safe_remove_image(self.IDestination)
-            self._safe_remove_image(self.IServiceNumber)
-            self._safe_remove_image(self.IDisplayTime)
-            self.image_composition.add_image(self.IDestination)
-            self.image_composition.add_image(self.IServiceNumber)
-            self.image_composition.add_image(self.IDisplayTime)
+        self._safe_remove_image(self.IDestination)
+        self._safe_remove_image(self.IServiceNumber)
+        self._safe_remove_image(self.IDisplayTime)
+
+        self.image_composition.add_image(self.IDestination)
+        self.image_composition.add_image(self.IServiceNumber)
+        self.image_composition.add_image(self.IDisplayTime)
+
+        self.image_composition.refresh()  # Ensure cleanup
 
     def addPartner(self, partner):
         self.partner = partner
@@ -1393,6 +1373,7 @@ async def display(board, device, image_composition, FontTime):
 
 
 async def main():
+    # Create the display device
     DisplayParser = cmdline.create_parser(
         description="Dynamically connect to either a virtual or physical display."
     )
@@ -1410,69 +1391,85 @@ async def main():
             ]
         )
     )
+    
+    # Configure GIF output if using gifanim emulator
     if Args.Display == "gifanim":
         device._filename = str(Args.filename)
         device._max_frames = int(Args.maxframes)
 
+    # Create the image composition
     image_composition = ImageComposition(device)
+
+    # Load font for clock
     FontTime = ImageFont.truetype(
         "%s/resources/time.otf"
         % (os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))),
         16,
     )
+
+    # Initialize device contrast
     device.contrast(255)
     energyMode = "normal"
-    StartUpDate = datetime.now().date()
-    # Show splash once at startup
+
+    # Show the splash screen at startup
     Splash(device)
 
-    # Start blink thread
-    BlinkState.start()
+    # Start async blink task
+    blink_task = asyncio.create_task(BlinkState.start())
 
+    # Initialize the board
     board = boardFixed(image_composition, Args.Delay, device)
+    await board.first_fetch()  # Fetch initial data
 
-    # Perform the initial fetch asynchronously so board has data
-    await board.first_fetch()
+    try:
+        while True:
+            # Handle device state (if the board has crashed or stopped updating)
+            if board.State == "dead":
+                del board
+                board = boardFixed(image_composition, Args.Delay, device)
+                device.clear()
+                await board.fetch_and_sort_services()
+                board.set_initial_cards()
 
-    # The main update loop
-    while True:
-        # If the board died, re-init
-        if board.State == "dead":
-            del board
-            board = boardFixed(image_composition, Args.Delay, device)
-            device.clear()
-            await board.fetch_and_sort_services()
-            board.set_initial_cards()
+            # Handle energy saver mode (dim/off)
+            if Args.EnergySaverMode != "none" and is_time_between():
+                if Args.EnergySaverMode == "dim":
+                    if energyMode == "normal":
+                        device.contrast(15)  # Lower brightness
+                        energyMode = "dim"
+                    await display(board, device, image_composition, FontTime)
+                elif Args.EnergySaverMode == "off":
+                    if energyMode == "normal":
+                        device.clear()
+                        device.hide()
+                        energyMode = "off"
+            else:
+                # Normal mode
+                if energyMode != "normal":
+                    device.contrast(255)
+                    if energyMode == "off":
+                        device.show()
+                        Splash(device)  # Optional re-splash
+                        board = boardFixed(image_composition, Args.Delay, device)
+                        await board.first_fetch()
+                    energyMode = "normal"
 
-        # Handle energy saver logic
-        if Args.EnergySaverMode != "none" and is_time_between():
-            # If within inactive hours
-            if Args.EnergySaverMode == "dim":
-                if energyMode == "normal":
-                    device.contrast(15)
-                    energyMode = "dim"
-                await display(board, device, image_composition, FontTime)
-            elif Args.EnergySaverMode == "off":
-                if energyMode == "normal":
-                    device.clear()
-                    device.hide()
-                    energyMode = "off"
-        else:
-            # Normal mode
-            if energyMode != "normal":
-                device.contrast(255)
-                if energyMode == "off":
-                    device.show()
-                    Splash()  # optional re-splash
-                    board = boardFixed(image_composition, Args.Delay, device)
-                    await board.first_fetch()
-                energyMode = "normal"
-            # Draw the clock and update the display
-            await display(board, device, image_composition, FontTime)
+                # Use asyncio.gather to prevent sequential blocking
+                tasks = [
+                    asyncio.create_task(board.tick()),
+                    asyncio.create_task(display(board, device, image_composition, FontTime))
+                ]
+                await asyncio.gather(*tasks)  # Run tasks concurrently
 
-        # Replace old 'time.sleep(0.02)' with a non-blocking pause
-        await asyncio.sleep(0.02)
+            await asyncio.sleep(0.02)  # Non-blocking delay
 
+    except KeyboardInterrupt:
+        print("Shutting down...")
+        BlinkState.stop()  # Stop blinking on Ctrl+C
+        blink_task.cancel()  # Cancel blink task
+        device.clear()
+        device.hide()
+        device.cleanup()
 
 # Standard async/await entry point
 if __name__ == "__main__":
