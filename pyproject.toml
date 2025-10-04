@@ -1,0 +1,19 @@
+[project]
+name = "bus-departure-board"
+version = "0.1.0"
+description = "Swiss departure board display for Raspberry Pi"
+requires-python = ">=3.10"
+dependencies = [
+    "inflect>=5.3.0",
+    "luma-core>=2.3.1",
+    "luma-emulator>=1.4.0",
+    "luma-oled>=3.8.1",
+    "lxml>=4.6.3",
+    "nre-darwin-py>=0.3.0",
+    "pillow>=8.3.1",
+    "pygame>=2.0.1",
+    "requests>=2.31.0",
+]
+
+[tool.uv]
+package = false

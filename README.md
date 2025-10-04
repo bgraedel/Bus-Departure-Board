@@ -41,3 +41,34 @@ If you've found a bug and would like to report it please create a GitHub issue o
 
 ## Example Video
 [![Watch demostration video here](https://img.youtube.com/vi/9egAmw3UAvU/0.jpg)](https://www.youtube.com/watch?v=9egAmw3UAvU)
+
+## Running as a Linux Service with uv
+
+The repository now ships with a [`pyproject.toml`](./pyproject.toml) so that
+[uv](https://github.com/astral-sh/uv) can manage the Python runtime and dependencies.
+To run the display permanently on a Linux host (for example, a Raspberry Pi)
+follow these steps:
+
+1. Install uv and copy the project to the target directory (e.g. `/opt/bus-departure-board`).
+2. From the project root run `uv sync` to create the managed environment under `.venv/`.
+3. Copy `services/bus-departure-board.service` to `/etc/systemd/system/` and edit it so that
+	`WorkingDirectory`, `ExecStart`, `User`, and `Group` match your setup.
+4. Create `/etc/default/bus-departure-board` (or another file referenced by the service) and set
+	any required environment variables, for example:
+
+	```bash
+	OJP_API_KEY=your_api_key_here
+	BOARD_ARGS="--Speed 1 --Delay 180"
+	```
+
+5. Ensure the helper script is executable: `chmod +x scripts/run_board_uv.sh`.
+6. Reload systemd, enable, and start the service:
+
+	```bash
+	sudo systemctl daemon-reload
+	sudo systemctl enable --now bus-departure-board.service
+	```
+
+The service executes `scripts/run_board_uv.sh`, which in turn uses `uv run` to start
+`ojp_departures.py` inside the managed environment. Any environment variables defined in
+`/etc/default/bus-departure-board` will be available to the program when it launches.

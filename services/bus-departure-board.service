@@ -1,0 +1,17 @@
+[Unit]
+Description=Bus Departure Board display
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/bus-departure-board
+WorkingDirectory=/opt/bus-departure-board
+ExecStart=/opt/bus-departure-board/scripts/run_board_uv.sh
+Restart=on-failure
+RestartSec=5
+User=pi
+Group=pi
+
+[Install]
+WantedBy=multi-user.target
