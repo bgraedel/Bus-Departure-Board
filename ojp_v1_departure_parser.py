@@ -556,22 +556,28 @@ def filter_trips_by_station(trips: List[TransitTrip], station_keyword: str, max_
         if (keyword in trip.current_stop.name.lower() or
             any(keyword in stop.name.lower() for stop in trip.future_stops))
     ]
+    # sort by estimated departure time if available or fallback to timetabled departure
+    filtered_trips.sort(key=lambda t: t.current_stop.estimated_departure or t.current_stop.timetabled_departure)
+    # print service, destination and departure time
+    for trip in filtered_trips:
+        print(f"{trip.line} to {trip.destination} at {trip.current_stop.estimated_departure or trip.current_stop.timetabled_departure}")
     return filtered_trips[:max_length] if max_length else filtered_trips
 
 
 def fetch_locations(client, parser, stop_names):
-	locations = []
-	for stop in stop_names:
-		location_params = OJPLocationRequestParams(
-			location_name=stop,
-			max_results=1,
-			location_type="stop",
-		)
-		response = client.send_location_request(location_params)
-		parsed_locations = parser.parse_xml(response)
-		if parsed_locations:
-			locations.append(parsed_locations[0])
-	return locations
+    locations = []
+    for stop in stop_names:
+        print(f"Fetching location for {stop}")
+        location_params = OJPLocationRequestParams(
+            location_name=stop,
+            max_results=1,
+            location_type="stop",
+        )
+        response = client.send_location_request(location_params)
+        parsed_locations = parser.parse_xml(response)
+        if parsed_locations:
+            locations.append(parsed_locations[0])
+    return locations
 
 
 def main():

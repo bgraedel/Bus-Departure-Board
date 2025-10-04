@@ -1,7 +1,7 @@
 # This software was produced by Jonathan Foot (c) 2023, all rights reserved.
 # Project Website : https://departureboard.jonathanfoot.com
 # Documentation   : https://jonathanfoot.com/Projects/DepartureBoard
-# Description	 : This program allows you to display a live bus departure board for any UK bus stop nationally.
+# Description    : This program allows you to display a live bus departure board for any UK bus stop nationally.
 # Python 3 Required.
 
 import time
@@ -9,6 +9,9 @@ import inspect, os
 import sys
 import json
 import argparse
+import socket
+import textwrap
+from urllib.parse import urlparse
 from urllib.request import urlopen
 from PIL import ImageFont, Image, ImageDraw
 from luma.core.render import canvas
@@ -27,11 +30,14 @@ from ojp_v1_departure_parser import (
 import zoneinfo
 import threading
 from config import STOP_NAMES
+from typing import Optional
 
 # Used to get live data from the Transport API and represent a specific services and it's details.
 import asyncio
 from datetime import datetime
 import zoneinfo
+import gc
+from requests.exceptions import RequestException
 
 
 ###
@@ -86,14 +92,14 @@ parser.add_argument(
     "--Speed",
     help="What speed do you want the text to scroll at on the display; default is 3, must be greater than 0.",
     type=check_positive,
-    default=3,
+    default=1,
 )
 parser.add_argument(
     "-d",
     "--Delay",
     help="How long the display will pause before starting the next animation; default is 30, must be greater than 0.",
     type=check_positive,
-    default=30,
+    default=180,
 )
 parser.add_argument(
     "-r",
@@ -115,7 +121,7 @@ parser.add_argument(
     "--RequestLimit",
     help="Defines the minium amount of time the display must wait before making a new data request; default is 75(seconds)",
     type=check_positive,
-    default=15,
+    default=30,
 )
 parser.add_argument(
     "-z",
@@ -130,14 +136,14 @@ parser.add_argument(
     help="To save screen from burn in and prolong it's life it is recommend to have energy saving mode enabled. 'off' is default, between the hours set the screen will turn off. 'dim' will turn the screen brightness down, but not completely off. 'none' will do nothing and leave the screen on; this is not recommend, you can change your active hours instead.",
     type=str,
     choices=["none", "dim", "off"],
-    default="dim",
+    default="off",
 )
 parser.add_argument(
     "-i",
     "--InactiveHours",
     help="The period of time for which the display will go into 'Energy Saving Mode' if turned on; default is '23:00-07:00'",
     type=check_time,
-    default="23:00-07:00",
+    default="00:00-07:00",
 )
 parser.add_argument(
     "-o",
@@ -207,17 +213,23 @@ Args = parser.parse_args()
 
 ## Defines all the programs "global" variables
 # Defines the fonts used throughout most the program
+SCRIPT_DIR = os.path.dirname(
+    os.path.abspath(inspect.getfile(inspect.currentframe()))
+)
 BasicFontHeight = 14
 BasicFont = ImageFont.truetype(
-    "%s/resources/lower.ttf"
-    % (os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))),
-    BasicFontHeight,
+    os.path.join(SCRIPT_DIR, "resources", "lower.ttf"), BasicFontHeight
 )
 SmallFont = ImageFont.truetype(
-    "%s/resources/lower.ttf"
-    % (os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))),
-    12,
+    os.path.join(SCRIPT_DIR, "resources", "lower.ttf"), 12
 )
+
+BUS_ICON_PATH = os.path.join(SCRIPT_DIR, "resources", "bus.png")
+
+_BUS_ICON_BASE = Image.open(BUS_ICON_PATH).convert("RGBA")
+BUS_ICON_16 = _BUS_ICON_BASE.resize((16, 16), Image.LANCZOS)
+BUS_ICON_12 = _BUS_ICON_BASE.resize((12, 12), Image.LANCZOS)
+_BUS_ICON_BASE.close()
 
 if Args.LargeLineName and Args.ShowIndex:
     print(
@@ -239,6 +251,25 @@ client = OJPClient(
 
 # Fetch locations
 LOCATIONS = fetch_locations(client, LocationResponseParser(), STOP_NAMES)
+
+parsed_api_url = urlparse(client.base_url)
+API_HOST = parsed_api_url.hostname or "api.opentransportdata.swiss"
+API_PORT = parsed_api_url.port or (443 if parsed_api_url.scheme == "https" else 80)
+
+
+def has_network_connection(host=API_HOST, port=API_PORT, timeout=3):
+    """Attempt to open a socket to the API host to verify network reachability."""
+    try:
+        conn = socket.create_connection((host, port), timeout=timeout)
+        conn.close()
+        return True
+    except OSError:
+        return False
+
+
+async def check_network_async(host=API_HOST, port=API_PORT, timeout=3):
+    """Asynchronously check network reachability without blocking the event loop."""
+    return await asyncio.to_thread(has_network_connection, host, port, timeout)
 
 
 ###
@@ -376,12 +407,12 @@ class LiveTime:
         for i, trip in enumerate(all_trips):
             if trip.cancelled:
                 continue
-            print(
-                trip.current_stop.name,
-                trip.current_stop.estimated_departure,
-                trip.line,
-                trip.destination,
-            )
+            # print(
+            #     trip.current_stop.name,
+            #     trip.current_stop.estimated_departure,
+            #     trip.line,
+            #     trip.destination,
+            # )
             services.append(LiveTime(trip, i))
         print("New Data fetched at ", datetime.now())
 
@@ -411,8 +442,6 @@ class TextImage:
     def __init__(self, device, text):
         self.device = device
         self.text = text
-        self.ImageBus = Image.open("resources/bus.png").resize((16, 16))
-        self.ImageBlank = Image.new(device.mode, (16, 16), (0, 0, 0))
         self.image = None
         self.width = 0
         self.height = 0
@@ -423,15 +452,13 @@ class TextImage:
         draw = ImageDraw.Draw(self.image)
 
         if self.text == "<Bus>":
-            self.image.paste(self.ImageBus, (0, 0))
+            self.image.paste(BUS_ICON_16, (0, 0), BUS_ICON_16)
             self.width = 16
             self.height = 16
         elif self.text == "<Bus> blinking":
             # Use the global blink state
             if BlinkState.is_visible():
-                self.image.paste(self.ImageBus, (0, 0))
-            else:
-                self.image.paste(self.ImageBlank, (0, 0))
+                self.image.paste(BUS_ICON_16, (0, 0), BUS_ICON_16)
             self.width = 16
             self.height = 16
         else:
@@ -439,6 +466,7 @@ class TextImage:
             self.width = 5 + int(draw.textlength(self.text, BasicFont))
             self.height = 5 + BasicFontHeight
         del draw
+    
 
 
 # Used to create the Service number text box, due to needing to adjust font size dynamically.
@@ -492,9 +520,7 @@ class StaticTextImage:
         # --- Draw the *new* service (on the lower half: y=16) ---
         if service.ServiceNumber in ["<Bus>", "<Bus> blinking"]:
             # Draw bus icon
-            bus_img = Image.open("resources/bus.png").resize((16, 16))
-            # (x=0, y=16) is where you used to draw text for the new service number
-            self.image.paste(bus_img, (0, 16), bus_img)
+            self.image.paste(BUS_ICON_16, (0, 16), BUS_ICON_16)
         else:
             # Draw regular text
             draw.text(
@@ -519,8 +545,7 @@ class StaticTextImage:
 
         # --- Draw the *previous* service (on the upper half: y=0) ---
         if previous_service.ServiceNumber in ["<Bus>", "<Bus> blinking"]:
-            bus_img_prev = Image.open("icons8-bus-48.png").resize((10, 10))
-            self.image.paste(bus_img_prev, (0, 0), bus_img_prev)
+            self.image.paste(BUS_ICON_12, (0, 2), BUS_ICON_12)
         else:
             draw.text(
                 (0, 0),
@@ -579,6 +604,93 @@ class NoService:
         self.width = int(draw.textlength(msg, font=BasicFont))
         self.height = h
         del draw
+
+
+class OutageImageFactory:
+    """Creates simple visual overlays to indicate outage conditions."""
+
+    def __init__(self, device):
+        self.device = device
+        title_size = 22 if device.height >= 64 else 16
+        self.title_font = ImageFont.truetype(
+            os.path.join(SCRIPT_DIR, "resources", "Bold.ttf"), title_size
+        )
+        self.body_font = BasicFont
+
+    def build(self, reason: str, details: Optional[str] = None) -> Image.Image:
+        w, h = self.device.width, self.device.height
+        image = Image.new(self.device.mode, (w, h), "black")
+        draw = ImageDraw.Draw(image)
+
+        # Messages per outage type
+        messages = {
+            "wifi": ("No Wi-Fi Signal", "Reconnect to continue."),
+            "api": ("Transit Feed Offline", "Trying again shortly."),
+            "unknown": ("Display Paused", "Attempting recovery."),
+        }
+
+        title, body = messages.get(reason, messages["unknown"])
+
+        # Draw symbolic representation
+        center_x, center_y = w // 2, h // 2 - 6
+        tint = "white"
+        if reason == "wifi":
+            max_radius = min(w, h) // 3
+            for radius in range(max_radius, max_radius // 3, -max(4, max_radius // 4)):
+                bbox = (
+                    center_x - radius,
+                    center_y - radius,
+                    center_x + radius,
+                    center_y + radius,
+                )
+                draw.arc(bbox, start=210, end=330, fill=tint, width=2)
+            draw.ellipse((center_x - 5, center_y + 6, center_x + 5, center_y + 16), fill=tint)
+        elif reason == "api":
+            triangle_half = min(w, h) // 5
+            points = [
+                (center_x, center_y - triangle_half * 2),
+                (center_x - triangle_half * 2, center_y + triangle_half * 2),
+                (center_x + triangle_half * 2, center_y + triangle_half * 2),
+            ]
+            draw.polygon(points, outline=tint, width=2)
+            draw.line(
+                (center_x, center_y - triangle_half + 4, center_x, center_y + triangle_half - 2),
+                fill=tint,
+                width=2,
+            )
+            draw.ellipse((center_x - 3, center_y + triangle_half + 4, center_x + 3, center_y + triangle_half + 10), fill=tint)
+        else:
+            draw.rectangle(
+                (center_x - 18, center_y - 18, center_x + 18, center_y + 18),
+                outline=tint,
+                width=2,
+            )
+            draw.line((center_x - 12, center_y, center_x + 12, center_y), fill=tint, width=2)
+
+        # Draw text messages
+        title_width = draw.textlength(title, font=self.title_font)
+        draw.text(
+            ((w - title_width) / 2, h - 28),
+            title,
+            font=self.title_font,
+            fill=tint,
+        )
+
+        body_text = body
+        if details:
+            trimmed = textwrap.shorten(details, width=40, placeholder="…")
+            body_text = f"{body}\n{trimmed}"
+
+        draw.multiline_text(
+            (10, h - 20),
+            body_text,
+            font=self.body_font,
+            fill=tint,
+            spacing=2,
+        )
+
+        del draw
+        return image
 
 
 ###
@@ -768,6 +880,8 @@ class ScrollTime:
             if hasattr(self, "IDisplayTime"):
                 del self.IDisplayTime
 
+        gc.collect()  # Force garbage collection to free up memory
+
         if self.partner is not None and self.partner.CurrentService.ID != "0":
             self.partner.refresh()
 
@@ -784,6 +898,7 @@ class ScrollTime:
         try:
             if image in self.image_composition.composed_images:
                 self.image_composition.remove_image(image)
+                del image
         except:
             pass  # Image wasn't in the composition
 
@@ -793,6 +908,7 @@ class ScrollTime:
         self._safe_remove_image(self.IDestination)
         self._safe_remove_image(self.IServiceNumber)
         self._safe_remove_image(self.IDisplayTime)
+        gc.collect()
         self.image_composition.refresh()  # Force refresh to clear memory
 
     #
@@ -943,12 +1059,7 @@ def Splash(device):
                 (64, 10),
                 "Departure Board",
                 font=ImageFont.truetype(
-                    "%s/resources/Bold.ttf"
-                    % (
-                        os.path.dirname(
-                            os.path.abspath(inspect.getfile(inspect.currentframe()))
-                        )
-                    ),
+                    os.path.join(SCRIPT_DIR, "resources", "Bold.ttf"),
                     20,
                 ),
                 align="center",
@@ -957,12 +1068,7 @@ def Splash(device):
                 (45, 35),
                 "Apdapted from Jonathan Foot",
                 font=ImageFont.truetype(
-                    "%s/resources/Skinny.ttf"
-                    % (
-                        os.path.dirname(
-                            os.path.abspath(inspect.getfile(inspect.currentframe()))
-                        )
-                    ),
+                    os.path.join(SCRIPT_DIR, "resources", "Skinny.ttf"),
                     15,
                 ),
                 align="center",
@@ -981,22 +1087,24 @@ class boardFixed:
         self.Services = []  # full list of fetched services
         self.State = "alive"
         self.ticks = 0
-
         # Add locks for different resources
         self.services_lock = asyncio.Lock()  # For protecting Services list updates
         self.display_lock = asyncio.Lock()  # For protecting display updates
         self.rotation_lock = asyncio.Lock()  # For protecting rotation index updates
-
+        # Add a queue for incoming data updates (bounded to avoid backlog)
+        self.update_queue = asyncio.Queue(maxsize=3)
         # Global pointer for cycling through the rotating services.
         self.rotating_index = 0
         # Flag to ensure a coordinated update of rows 2 and 3.
         self.rotating_update_pending = False
-
         # These will hold our three ScrollTime rows.
         self.top = None  # Row 1 (pinned)
         self.middle = None  # Row 2
         self.bottom = None  # Row 3
-
+        self.outage_state: Optional[str] = None
+        self.outage_details: Optional[str] = None
+        self.outage_overlay: Optional[ComposableImage] = None
+        self.outage_factory = OutageImageFactory(device)
         # Prepare a fallback "No Services" image.
         no_service_image = NoService(device)
         self.NoServices = ComposableImage(
@@ -1012,34 +1120,38 @@ class boardFixed:
         Called once at startup to fetch data and build the initial cards.
         """
         await self.fetch_and_sort_services()
-        self.set_initial_cards()
+        await self.process_pending_updates()
+        if not self.outage_state:
+            self.set_initial_cards()
 
     async def fetch_and_sort_services(self):
         """
-        Fetch new service data asynchronously and sort by earliest departure.
-        Uses a lock to prevent concurrent modifications to the Services list.
+        Fetch new service data asynchronously and put it in the update queue.
+        This no longer directly updates the Services list.
         """
-        async with self.services_lock:
-            # Store current service IDs before fetching
-            current_ids = []
-            if self.top and self.top.CurrentService.ID != "0":
-                current_ids.append(self.top.CurrentService.ID)
-            if self.middle and self.middle.CurrentService.ID != "0":
-                current_ids.append(self.middle.CurrentService.ID)
-            if self.bottom and self.bottom.CurrentService.ID != "0":
-                current_ids.append(self.bottom.CurrentService.ID)
+        if not await check_network_async():
+            LiveTime.LastUpdate = datetime.now()
+            await self._enqueue_update({"type": "error", "reason": "wifi"})
+            return False
 
-            # Fetch new data
+        try:
+            # Fetch new data without holding any locks
             data = await LiveTime.GetDataAsync()
             data.sort(
                 key=lambda svc: svc.ExptArrival if svc.ExptArrival else svc.SchArrival
             )
 
-            # Check for changes
-            old_services = self.Services.copy() if hasattr(self, "Services") else []
-            self.Services = data
-
-            return old_services != self.Services
+            # Put the sorted data in the queue for processing during the next tick
+            await self._enqueue_update({"type": "data", "payload": data})
+            return True
+        except RequestException as e:
+            LiveTime.LastUpdate = datetime.now()
+            await self._enqueue_update({"type": "error", "reason": "api", "details": str(e)})
+            return False
+        except Exception as e:
+            LiveTime.LastUpdate = datetime.now()
+            await self._enqueue_update({"type": "error", "reason": "unknown", "details": str(e)})
+            return False
 
     def split_pinned_rotating(self):
         """
@@ -1109,11 +1221,107 @@ class boardFixed:
         self.middle.addPartner(self.bottom)
         # Reset the rotating pointer.
         self.rotating_index = 0
+        self.State = "alive"
+
+    def _remove_if_present(self, image: Optional[ComposableImage]):
+        if not image:
+            return
+        try:
+            self.image_composition.remove_image(image)
+        except ValueError:
+            pass
+
+    def _teardown_cards(self):
+        for attr in ("top", "middle", "bottom"):
+            card = getattr(self, attr)
+            if card:
+                card.delete()
+                setattr(self, attr, None)
+
+    async def _enqueue_update(self, item):
+        """Ensure only the latest update is queued to avoid backlog growth."""
+        while not self.update_queue.empty():
+            try:
+                _ = self.update_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        await self.update_queue.put(item)
+
+    def show_outage(self, reason: str, details: Optional[str] = None):
+        """Display a visual overlay describing the outage reason."""
+        if self.outage_state == reason and self.outage_overlay is not None:
+            # Update text if details changed
+            if self.outage_details != details:
+                self._remove_if_present(self.outage_overlay)
+            else:
+                self.outage_details = details
+                return
+
+        self.outage_state = reason
+        self.outage_details = details
+
+        # Clear existing display elements
+        self._teardown_cards()
+        self._remove_if_present(self.NoServices)
+        self._remove_if_present(self.outage_overlay)
+
+        outage_img = self.outage_factory.build(reason, details)
+        self.outage_overlay = ComposableImage(outage_img, position=(0, 0))
+        self.image_composition.add_image(self.outage_overlay)
+        self.image_composition.refresh()
+        self.State = "outage"
+
+    def clear_outage(self):
+        """Remove outage overlay and reset state."""
+        if self.outage_overlay:
+            self._remove_if_present(self.outage_overlay)
+            self.outage_overlay = None
+        self.outage_state = None
+        self.outage_details = None
+        if self.State == "dead":
+            self._remove_if_present(self.NoServices)
+            self.State = "alive"
+
+    async def process_pending_updates(self):
+        """Handle queued data or error updates without blocking the render loop."""
+        processed = False
+        while not self.update_queue.empty():
+            try:
+                item = await asyncio.wait_for(self.update_queue.get(), 0.01)
+            except asyncio.TimeoutError:
+                break
+
+            kind = item.get("type") if isinstance(item, dict) else "data"
+
+            if kind == "data":
+                data = item.get("payload", []) if isinstance(item, dict) else item
+                changed = False
+                async with self.services_lock:
+                    if self.Services != data:
+                        self.Services = data
+                        changed = True
+
+                if changed:
+                    self.clear_outage()
+                    if self.top is None:
+                        self._teardown_cards()
+                        self.set_initial_cards()
+                    else:
+                        await self.update_display_with_new_data()
+            elif kind == "error":
+                reason = item.get("reason", "unknown")
+                details = item.get("details")
+                self.show_outage(reason, details)
+
+            self.update_queue.task_done()
+            processed = True
+
+        return processed
 
     async def update_display_with_new_data(self):
         """
         Updates the display with new data while trying to preserve the current view state.
-        Minimizes lock contention by performing calculations outside critical sections.
+        Calculations are done outside of locks to minimize contention.
         """
         # If this is the first time, do a full initialization
         if self.top is None:
@@ -1124,7 +1332,7 @@ class boardFixed:
         # Get data with minimal lock time
         current_visible_ids = []
         current_middle_id = None
-        
+
         async with self.services_lock:
             pinned, rotating = self.split_pinned_rotating()
             # Quickly gather the current state
@@ -1157,25 +1365,26 @@ class boardFixed:
                     if svc.ID == current_middle_id:
                         current_middle_idx = i
                         break
-                        
+
             if current_middle_idx >= 0:
                 # Found the current middle service - keep the same position
                 new_rotating_index = current_middle_idx
             elif len(current_visible_ids) > 0:
                 # Current service not found, try to find any visible service
+                found = False
                 for vis_id in current_visible_ids:
                     for i, svc in enumerate(rotating):
                         if svc.ID == vis_id:
                             new_rotating_index = i
+                            found = True
                             break
-                    else:
-                        continue
-                    break
+                    if found:
+                        break
 
             # Determine the indices for middle and bottom rows
             idx_middle = new_rotating_index % len(rotating)
             idx_bottom = (new_rotating_index + 1) % len(rotating) if len(rotating) > 1 else -1
-            
+
             # Prepare the new services to display
             next_middle = rotating[idx_middle]
             next_bottom = rotating[idx_bottom] if idx_bottom >= 0 else LiveTimeStud()
@@ -1189,7 +1398,7 @@ class boardFixed:
             # Only update the rotating index if we're actually changing it
             if new_rotating_index != self.rotating_index:
                 self.rotating_index = new_rotating_index
-                
+
             # Only apply changes where needed
             if next_top:
                 self.top.changeCard(next_top)
@@ -1201,14 +1410,37 @@ class boardFixed:
     async def tick(self):
         """
         Called repeatedly to:
-        1. Animate each row
-        2. Force a data fetch if enough time has passed
+        1. Check for new data in the queue
+        2. Animate each row
         3. Handle a no-services state
         4. Force rotation cycle every N ticks
         """
-        # If the board hasn't been initialized yet, exit
-        if self.top is None:
+        await self.process_pending_updates()
+
+        if self.outage_state:
+            if LiveTime.TimePassed():
+                try:
+                    await self.fetch_and_sort_services()
+                except Exception as e:
+                    print("Error scheduling data fetch during outage:", e)
             return
+
+        if len(self.Services) == 0:
+            if self.State != "dead":
+                self._remove_if_present(self.outage_overlay)
+                self._teardown_cards()
+                self.image_composition.add_image(self.NoServices)
+                self.State = "dead"
+            return
+
+        if self.State == "dead":
+            self._remove_if_present(self.NoServices)
+            self.State = "alive"
+            if self.top is None:
+                self.set_initial_cards()
+
+        if self.top is None or self.middle is None or self.bottom is None:
+            self.set_initial_cards()
 
         # Animate each row
         await self.top.tick()
@@ -1221,28 +1453,12 @@ class boardFixed:
             self.ticks = 0
             await self.force_rotation_cycle()
 
-        # Forced time-based fetch check
+        # Forced time-based fetch check (now just schedules a fetch)
         if LiveTime.TimePassed():
             try:
-                changed = await self.fetch_and_sort_services()
-
-                # Only update the display if data has actually changed
-                if changed:
-                    await self.update_display_with_new_data()
+                await self.fetch_and_sort_services()
             except Exception as e:
-                print("Error fetching new data:", e)
-
-        # Handle the "no services" case
-        if len(self.Services) == 0:
-            if self.ticks == 0:
-                self.image_composition.add_image(self.NoServices)
-            if not self.is_waiting():
-                self.top.delete()
-                self.middle.delete()
-                self.bottom.delete()
-                self.image_composition.remove_image(self.NoServices)
-                self.State = "dead"
-            return
+                print("Error scheduling data fetch:", e)
 
     def is_waiting(self):
         """
@@ -1259,42 +1475,44 @@ class boardFixed:
         Force a complete rotation of the visible services
         Protected by rotation_lock to prevent concurrent rotations
         """
+        if self.outage_state:
+            return
         async with self.rotation_lock:
             if len(self.Services) <= 1:  # Don't rotate if not enough services
                 return
-
             async with self.services_lock:
                 pinned, rotating = self.split_pinned_rotating()
-
             if len(rotating) <= 1:  # Don't rotate if not enough rotating services
                 return
-
             # Advance to next pair of services
             self.rotating_index = (self.rotating_index + 1) % len(rotating)
-
             # Get the services to display
             middle_service = rotating[self.rotating_index]
             bottom_service = rotating[(self.rotating_index + 1) % len(rotating)]
-
             # Update the cards - need display lock
-            print(
-                f"Force rotating to services {middle_service.ServiceNumber} and {bottom_service.ServiceNumber}"
-            )
+            # print(
+            #     f"Force rotating to services {middle_service.ServiceNumber} and {bottom_service.ServiceNumber}"
+            # )
             async with self.display_lock:
                 self.middle.changeCard(middle_service)
                 self.bottom.changeCard(bottom_service)
 
     async def requestCardChange(self, card, row):
+        """
+        Called when a card needs to be changed due to scrolling or other events.
+        Uses the queue to schedule updates instead of doing them immediately.
+        """
+        if self.outage_state:
+            return
         async with self.rotation_lock:
-            # If it's time for a new fetch, do that.
+            # If it's time for a fetch, schedule it but don't process immediately
             if LiveTime.TimePassed():
                 try:
-                    await self.fetch_and_sort_services()  # This already has its own lock
-                    async with self.display_lock:
-                        self.set_initial_cards()
+                    # This will put data in the queue, to be processed next tick
+                    await self.fetch_and_sort_services()
                     return
                 except Exception as e:
-                    print("Error fetching new data:", e)
+                    print("Error scheduling data fetch:", e)
                     return
 
             async with self.services_lock:
@@ -1312,12 +1530,11 @@ class boardFixed:
 
             if self.rotating_update_pending:
                 return  # Already updating; skip duplicate calls.
-            self.rotating_update_pending = True
 
+            self.rotating_update_pending = True
             try:
                 # Rest of the method with appropriate lock usage
                 async with self.display_lock:
-
                     # Ensure we have at least one rotating service
                     if len(rotating) == 0:
                         # No rotating services available, show blanks
@@ -1332,19 +1549,32 @@ class boardFixed:
                         # Calculate the indices for the two rows
                         idx_middle = self.rotating_index % len(rotating)
                         idx_bottom = (self.rotating_index + 1) % len(rotating)
-
                         # Update both rows
                         self.middle.changeCard(rotating[idx_middle])
                         self.bottom.changeCard(rotating[idx_bottom])
-
                         # Increment rotating_index to show next set of services in the next cycle
                         self.rotating_index = (self.rotating_index + 1) % len(rotating)
                         # Debug output to verify cycling
-                        print(
-                            f"Updated rotating index to {self.rotating_index}, showing services {idx_middle} and {idx_bottom}"
-                        )
+                        # print(
+                        #     f"Updated rotating index to {self.rotating_index}, showing services {idx_middle} and {idx_bottom}"
+                        # )
             finally:
                 self.rotating_update_pending = False
+
+
+# Also need to update the background fetcher function to work with the queue system
+async def fetch_data_periodically(board):
+    """
+    Runs in the background, fetching new data every X seconds without blocking rendering.
+    Now uses the queue system to avoid interrupting the display updates.
+    """
+    while True:
+        await asyncio.sleep(Args.RequestLimit)  # Wait before fetching again
+        try:
+            # This will put the data in the queue rather than updating directly
+            await board.fetch_and_sort_services()
+        except Exception as e:
+            print(f"Error fetching new data: {e}")
 
 
 def is_time_between():
@@ -1359,15 +1589,8 @@ def is_time_between():
             check_time >= Args.InactiveHours[0] or check_time <= Args.InactiveHours[1]
         )
 
-
-# Draws the clock and tells the rest of the display next frame wanted
-
-
 async def display(board, device, image_composition, FontTime):
-    # Now that board.tick() is async, we do:
-    await board.tick()
-
-    # Everything else can stay as synchronous as needed
+    """Render the current frame to the device without mutating board state."""
     msgTime = str(
         datetime.now().strftime("%H:%M" if (Args.TimeFormat == 24) else "%I:%M")
     )
@@ -1385,21 +1608,6 @@ async def display(board, device, image_composition, FontTime):
             font=FontTime,
             align="center",
         )
-
-
-async def fetch_data_periodically(board):
-    """
-    Runs in the background, fetching new data every X seconds without blocking rendering.
-    """
-    while True:
-        await asyncio.sleep(Args.RequestLimit)  # Wait before fetching again
-        try:
-            changed = await board.fetch_and_sort_services()  # Get new data
-
-            if changed:  # Only update if there's new data
-                await board.update_display_with_new_data()
-        except Exception as e:
-            print(f"Error fetching new data: {e}")
 
 
 async def main():
@@ -1432,8 +1640,7 @@ async def main():
 
     # Load font for clock
     FontTime = ImageFont.truetype(
-        "%s/resources/time.otf"
-        % (os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))),
+        os.path.join(SCRIPT_DIR, "resources", "time.otf"),
         16,
     )
 
@@ -1455,7 +1662,7 @@ async def main():
     fetch_task = asyncio.create_task(fetch_data_periodically(board))
 
     # === New Frame Timing Setup ===
-    target_fps = 50  # Set target FPS
+    target_fps = 30  # Set target FPS
     frame_time = 1 / target_fps  # Target time per frame
 
     try:
@@ -1468,7 +1675,10 @@ async def main():
                     if energyMode == "normal":
                         device.contrast(15)
                         energyMode = "dim"
-                    await display(board, device, image_composition, FontTime)
+                    await asyncio.gather(
+                        board.tick(),
+                        display(board, device, image_composition, FontTime),
+                    )
                 elif Args.EnergySaverMode == "off":
                     if energyMode == "normal":
                         device.clear()
@@ -1511,3 +1721,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         BlinkState.stop()
+        print("Program interrupted. Exiting...")

@@ -1,3 +1,4 @@
 STOP_NAMES = [
-    "Bern, Bahnhof",
+    "Bern, Wander (Bern)",
+    "Bern, Weissenbühl (Tram) (Bern)",
 ]
