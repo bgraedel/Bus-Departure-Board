@@ -11,6 +11,7 @@ import json
 import argparse
 import socket
 import textwrap
+import math
 from urllib.parse import urlparse
 from urllib.request import urlopen
 from PIL import ImageFont, Image, ImageDraw
@@ -28,16 +29,13 @@ from ojp_v1_departure_parser import (
     fetch_locations,
 )
 import zoneinfo
-import threading
 from config import STOP_NAMES
 from typing import Optional
 
 # Used to get live data from the Transport API and represent a specific services and it's details.
 import asyncio
 from datetime import datetime
-import zoneinfo
-import gc
-from requests.exceptions import RequestException
+from requests.exceptions import RequestException, ConnectionError as RequestsConnectionError
 
 
 ###
@@ -293,6 +291,8 @@ class LiveTimeStud:
 class LiveTime:
     # The last time an API call was made to get new data.
     LastUpdate = datetime.now()
+    # Tracks whether a fetch is currently running so we don't schedule overlapping work.
+    FetchInProgress = False
 
     def __init__(self, Data: TransitTrip, Index):
         self.ID = str(Data.journey_ref)
@@ -342,6 +342,8 @@ class LiveTime:
     # Returns True/False if enough time passed since last update (to avoid API spam).
     @staticmethod
     def TimePassed():
+        if LiveTime.FetchInProgress:
+            return False
         return (
             datetime.now() - LiveTime.LastUpdate
         ).total_seconds() > Args.RequestLimit
@@ -474,11 +476,12 @@ class TextImageServiceNumber:
     def __init__(self, device, text):
         self.image = Image.new(device.mode, (device.width, 16))
         draw = ImageDraw.Draw(self.image)
-        draw.text(
-            (0, 0), text, font=BasicFont if len(text) <= 3 else SmallFont, fill="white"
-        )
+        font = BasicFont if len(text) <= 3 else SmallFont
+        draw.text((0, 0), text, font=font, fill="white")
 
-        self.width = 5 + int(draw.textlength(text, BasicFont))
+        bbox = font.getbbox(text) if text else (0, 0, 0, 0)
+        text_width = bbox[2] - bbox[0]
+        self.width = 5 + int(math.ceil(text_width))
         self.height = 5 + BasicFontHeight
         del draw
 
@@ -486,23 +489,26 @@ class TextImageServiceNumber:
 # Used to create the destination and via board.
 class TextImageComplex:
     def __init__(self, device, destination, via, startOffset):
-        self.image = Image.new(device.mode, (device.width * 20, 16))
+        destination = destination or ""
+        via = via or ""
+
+        dest_bbox = BasicFont.getbbox(destination) if destination else (0, 0, 0, 0)
+        dest_width = dest_bbox[2] - dest_bbox[0]
+        via_bbox = BasicFont.getbbox(via) if via else (0, 0, 0, 0)
+        via_width = via_bbox[2] - via_bbox[0]
+
+        available_width = max(device.width - startOffset, dest_width)
+        via_start = max(available_width, dest_width + 6) if via_width else available_width
+        content_width = max(available_width, dest_width, via_start + via_width)
+        image_width = max(int(math.ceil(content_width)) + 2, 1)
+
+        self.image = Image.new(device.mode, (image_width, 16))
         draw = ImageDraw.Draw(self.image)
         draw.text((0, 0), destination, font=BasicFont, fill="white")
-        draw.text(
-            (
-                max(
-                    (device.width - startOffset),
-                    int(draw.textlength(destination, font=BasicFont)) + 6,
-                ),
-                0,
-            ),
-            via,
-            font=BasicFont,
-            fill="white",
-        )
+        if via_width:
+            draw.text((via_start, 0), via, font=BasicFont, fill="white")
 
-        self.width = device.width + int(draw.textlength(via, BasicFont)) - startOffset
+        self.width = int(math.ceil(content_width))
         self.height = 16
         del draw
 
@@ -624,7 +630,7 @@ class OutageImageFactory:
 
         # Messages per outage type
         messages = {
-            "wifi": ("No Wi-Fi Signal", "Reconnect to continue."),
+            "wifi": ("No Network Connection", "Check Wi-Fi or Ethernet."),
             "api": ("Transit Feed Offline", "Trying again shortly."),
             "unknown": ("Display Paused", "Attempting recovery."),
         }
@@ -880,8 +886,6 @@ class ScrollTime:
             if hasattr(self, "IDisplayTime"):
                 del self.IDisplayTime
 
-        gc.collect()  # Force garbage collection to free up memory
-
         if self.partner is not None and self.partner.CurrentService.ID != "0":
             self.partner.refresh()
 
@@ -908,7 +912,6 @@ class ScrollTime:
         self._safe_remove_image(self.IDestination)
         self._safe_remove_image(self.IServiceNumber)
         self._safe_remove_image(self.IDisplayTime)
-        gc.collect()
         self.image_composition.refresh()  # Force refresh to clear memory
 
     #
@@ -1105,6 +1108,9 @@ class boardFixed:
         self.outage_details: Optional[str] = None
         self.outage_overlay: Optional[ComposableImage] = None
         self.outage_factory = OutageImageFactory(device)
+        self.network_state: str = "online"
+        self.network_details: Optional[str] = None
+        self._fetch_task: Optional[asyncio.Task] = None
         # Prepare a fallback "No Services" image.
         no_service_image = NoService(device)
         self.NoServices = ComposableImage(
@@ -1129,12 +1135,23 @@ class boardFixed:
         Fetch new service data asynchronously and put it in the update queue.
         This no longer directly updates the Services list.
         """
-        if not await check_network_async():
-            LiveTime.LastUpdate = datetime.now()
-            await self._enqueue_update({"type": "error", "reason": "wifi"})
+        if LiveTime.FetchInProgress:
             return False
 
         try:
+            LiveTime.FetchInProgress = True
+            if not await check_network_async():
+                LiveTime.LastUpdate = datetime.now()
+                await self._enqueue_update(
+                    {
+                        "type": "error",
+                        "reason": "wifi",
+                        "details": f"Cannot reach {API_HOST}:{API_PORT}",
+                    }
+                )
+                return False
+
+            LiveTime.LastUpdate = datetime.now()
             # Fetch new data without holding any locks
             data = await LiveTime.GetDataAsync()
             data.sort(
@@ -1144,14 +1161,57 @@ class boardFixed:
             # Put the sorted data in the queue for processing during the next tick
             await self._enqueue_update({"type": "data", "payload": data})
             return True
+        except asyncio.CancelledError:
+            raise
         except RequestException as e:
             LiveTime.LastUpdate = datetime.now()
-            await self._enqueue_update({"type": "error", "reason": "api", "details": str(e)})
+            reason = "wifi" if isinstance(e, RequestsConnectionError) else "api"
+            await self._enqueue_update(
+                {"type": "error", "reason": reason, "details": str(e)}
+            )
             return False
         except Exception as e:
             LiveTime.LastUpdate = datetime.now()
             await self._enqueue_update({"type": "error", "reason": "unknown", "details": str(e)})
             return False
+        finally:
+            LiveTime.FetchInProgress = False
+
+    def _on_fetch_task_done(self, task: "asyncio.Task[bool]"):
+        if task is self._fetch_task:
+            self._fetch_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            print(f"Background fetch task exited with error: {exc}")
+
+    def _schedule_fetch(self) -> bool:
+        if self._fetch_task and not self._fetch_task.done():
+            return False
+        if LiveTime.FetchInProgress:
+            return False
+
+        try:
+            self._fetch_task = asyncio.create_task(self.fetch_and_sort_services())
+        except RuntimeError as exc:
+            print(f"Unable to schedule background fetch: {exc}")
+            self._fetch_task = None
+            return False
+        self._fetch_task.add_done_callback(self._on_fetch_task_done)
+        return True
+
+    async def shutdown(self):
+        if self._fetch_task and not self._fetch_task.done():
+            self._fetch_task.cancel()
+            try:
+                await self._fetch_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                print(f"Background fetch task exited with error: {exc}")
+        self._fetch_task = None
 
     def split_pinned_rotating(self):
         """
@@ -1243,9 +1303,32 @@ class boardFixed:
         while not self.update_queue.empty():
             try:
                 _ = self.update_queue.get_nowait()
+                self.update_queue.task_done()
             except asyncio.QueueEmpty:
                 break
         await self.update_queue.put(item)
+
+    def update_network_state(self, online: bool, details: Optional[str] = None):
+        """Toggle the connectivity flag and update the display when offline."""
+        if online:
+            if self.network_state != "online" or self.outage_state == "wifi":
+                self.network_state = "online"
+                self.network_details = None
+                if self.outage_state == "wifi":
+                    self.clear_outage()
+            return
+
+        # Network reported as offline
+        if (
+            self.network_state == "offline"
+            and self.outage_state == "wifi"
+            and self.network_details == details
+        ):
+            return
+
+        self.network_state = "offline"
+        self.network_details = details
+        self.show_outage("wifi", details)
 
     def show_outage(self, reason: str, details: Optional[str] = None):
         """Display a visual overlay describing the outage reason."""
@@ -1273,11 +1356,15 @@ class boardFixed:
 
     def clear_outage(self):
         """Remove outage overlay and reset state."""
+        previous_reason = self.outage_state
         if self.outage_overlay:
             self._remove_if_present(self.outage_overlay)
             self.outage_overlay = None
         self.outage_state = None
         self.outage_details = None
+        if previous_reason == "wifi" or self.network_state == "offline":
+            self.network_state = "online"
+            self.network_details = None
         if self.State == "dead":
             self._remove_if_present(self.NoServices)
             self.State = "alive"
@@ -1301,8 +1388,12 @@ class boardFixed:
                         self.Services = data
                         changed = True
 
-                if changed:
+                self.update_network_state(True)
+
+                if self.outage_state:
                     self.clear_outage()
+
+                if changed:
                     if self.top is None:
                         self._teardown_cards()
                         self.set_initial_cards()
@@ -1311,7 +1402,13 @@ class boardFixed:
             elif kind == "error":
                 reason = item.get("reason", "unknown")
                 details = item.get("details")
-                self.show_outage(reason, details)
+                if reason == "wifi":
+                    self.update_network_state(False, details)
+                else:
+                    if reason != "wifi" and self.network_state != "online":
+                        self.network_state = "online"
+                        self.network_details = None
+                    self.show_outage(reason, details)
 
             self.update_queue.task_done()
             processed = True
@@ -1419,10 +1516,7 @@ class boardFixed:
 
         if self.outage_state:
             if LiveTime.TimePassed():
-                try:
-                    await self.fetch_and_sort_services()
-                except Exception as e:
-                    print("Error scheduling data fetch during outage:", e)
+                self._schedule_fetch()
             return
 
         if len(self.Services) == 0:
@@ -1455,10 +1549,7 @@ class boardFixed:
 
         # Forced time-based fetch check (now just schedules a fetch)
         if LiveTime.TimePassed():
-            try:
-                await self.fetch_and_sort_services()
-            except Exception as e:
-                print("Error scheduling data fetch:", e)
+            self._schedule_fetch()
 
     def is_waiting(self):
         """
@@ -1507,13 +1598,8 @@ class boardFixed:
         async with self.rotation_lock:
             # If it's time for a fetch, schedule it but don't process immediately
             if LiveTime.TimePassed():
-                try:
-                    # This will put data in the queue, to be processed next tick
-                    await self.fetch_and_sort_services()
-                    return
-                except Exception as e:
-                    print("Error scheduling data fetch:", e)
-                    return
+                self._schedule_fetch()
+                return
 
             async with self.services_lock:
                 pinned, rotating = self.split_pinned_rotating()
@@ -1573,6 +1659,8 @@ async def fetch_data_periodically(board):
         try:
             # This will put the data in the queue rather than updating directly
             await board.fetch_and_sort_services()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print(f"Error fetching new data: {e}")
 
@@ -1690,8 +1778,19 @@ async def main():
                     if energyMode == "off":
                         device.show()
                         Splash(device)
+                        await board.shutdown()
+                        fetch_task.cancel()
+                        try:
+                            await fetch_task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception as exc:
+                            print(f"Background fetch task exited with error: {exc}")
                         board = boardFixed(image_composition, Args.Delay, device)
                         await board.first_fetch()
+                        fetch_task = asyncio.create_task(
+                            fetch_data_periodically(board)
+                        )
                     energyMode = "normal"
 
                 # Core UI updates
@@ -1711,6 +1810,19 @@ async def main():
         BlinkState.stop()  # Stop blinking
         blink_task.cancel()  # Cancel blink task
         fetch_task.cancel()  # Stop background fetching
+        await board.shutdown()
+        try:
+            await blink_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            print(f"Blink task exited with error: {exc}")
+        try:
+            await fetch_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            print(f"Background fetch task exited with error: {exc}")
         device.clear()
         device.hide()
         device.cleanup()
