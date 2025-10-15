@@ -12,6 +12,7 @@ import argparse
 import socket
 import textwrap
 import math
+import weakref
 from urllib.parse import urlparse
 from urllib.request import urlopen
 from PIL import ImageFont, Image, ImageDraw
@@ -707,19 +708,23 @@ class OutageImageFactory:
 # Used to ensure that only 1 animation is playing at any given time, apart from at the start; where all three can animate in.
 class Synchroniser:
     def __init__(self):
-        self.synchronised = {}
+        # Keep weak references so completed tasks vanish automatically.
+        self.synchronised: "weakref.WeakKeyDictionary[object, bool]" = (
+            weakref.WeakKeyDictionary()
+        )
 
     def busy(self, task):
-        self.synchronised[id(task)] = False
+        self.synchronised[task] = False
 
     def ready(self, task):
-        self.synchronised[id(task)] = True
+        self.synchronised[task] = True
+
+    def forget(self, task):
+        """Remove a task from the synchroniser once it is no longer active."""
+        self.synchronised.pop(task, None)
 
     def is_synchronised(self):
-        for task in self.synchronised.items():
-            if task[1] == False:
-                return False
-        return True
+        return all(self.synchronised.values())
 
 
 class BlinkState:
@@ -913,6 +918,7 @@ class ScrollTime:
         self._safe_remove_image(self.IServiceNumber)
         self._safe_remove_image(self.IDisplayTime)
         self.image_composition.refresh()  # Force refresh to clear memory
+        self.synchroniser.forget(self)
 
     #
     # ────────────────── ASYNC TICK ──────────────────
@@ -1752,6 +1758,8 @@ async def main():
     # === New Frame Timing Setup ===
     target_fps = 30  # Set target FPS
     frame_time = 1 / target_fps  # Target time per frame
+    min_frame_sleep = 0.001  # Always yield to the loop for at least 1ms
+    overrun_frames = 0  # Track consecutive frames that run long
 
     try:
         while True:
@@ -1801,7 +1809,20 @@ async def main():
 
             # === New Dynamic Timing Mechanism ===
             elapsed_time = asyncio.get_event_loop().time() - start_time
-            sleep_time = max(0, frame_time - elapsed_time)
+            sleep_time = frame_time - elapsed_time
+
+            if sleep_time <= 0:
+                overrun_frames += 1
+                # Emit an occasional warning so long-running drift is visible
+                if overrun_frames == 1 or overrun_frames % (target_fps * 60) == 0:
+                    print(
+                        "Render loop is running behind; CPU usage may climb if this persists."
+                    )
+                sleep_time = min_frame_sleep
+            else:
+                if overrun_frames:
+                    overrun_frames = 0
+                sleep_time = max(sleep_time, min_frame_sleep)
 
             await asyncio.sleep(sleep_time)
 
