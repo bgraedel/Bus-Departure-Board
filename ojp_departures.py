@@ -32,6 +32,7 @@ from ojp_v1_departure_parser import (
 import zoneinfo
 from config import STOP_NAMES
 from typing import Optional
+import logging
 
 # Used to get live data from the Transport API and represent a specific services and it's details.
 import asyncio
@@ -209,6 +210,66 @@ parser.add_argument(
 )
 
 Args = parser.parse_args()
+
+
+class ManagedImageComposition(ImageComposition):
+    """Track composition health and avoid unbounded refresh work."""
+
+    def __init__(self, device):
+        super().__init__(device)
+        self._dirty = True
+        self._max_images = 0
+        self._logger = logging.getLogger("composition")
+
+    def add_image(self, image):
+        if image in self.composed_images:
+            return
+        super().add_image(image)
+        self._dirty = True
+        self._max_images = max(self._max_images, len(self.composed_images))
+        if self._max_images and self._max_images % 32 == 0:
+            self._logger.debug(
+                "composition image pool peaked at %s entries", self._max_images
+            )
+
+    def remove_image(self, image):
+        try:
+            super().remove_image(image)
+            self._dirty = True
+        except ValueError:
+            return
+
+    def mark_dirty(self):
+        self._dirty = True
+
+    def refresh(self):
+        if not self._dirty:
+            return
+        self._prune_duplicates()
+        super().refresh()
+        self._dirty = False
+
+    def _prune_duplicates(self):
+        if len(self.composed_images) < 2:
+            return
+        seen_ids = set()
+        deduped = []
+        duplicates = 0
+        for img in self.composed_images:
+            marker = id(img)
+            if marker in seen_ids:
+                duplicates += 1
+                continue
+            seen_ids.add(marker)
+            deduped.append(img)
+        if duplicates:
+            self.composed_images[:] = deduped
+            self._logger.warning(
+                "Removed %s duplicate composable images; %s remain.",
+                duplicates,
+                len(self.composed_images),
+            )
+            self._dirty = True
 
 ## Defines all the programs "global" variables
 # Defines the fonts used throughout most the program
@@ -1038,6 +1099,9 @@ class ScrollTime:
             self.IDestination.offset = (self.image_x_pos, 0)
         if self.state in (self.OPENING_SCROLL, self.STUD_SCROLL):
             self.IStaticOld.offset = (0, self.image_y_posA)
+        mark_dirty = getattr(self.image_composition, "mark_dirty", None)
+        if callable(mark_dirty):
+            mark_dirty()
 
     def refresh(self):
         self._safe_remove_image(self.IDestination)
@@ -1730,7 +1794,7 @@ async def main():
         device._max_frames = int(Args.maxframes)
 
     # Create the image composition
-    image_composition = ImageComposition(device)
+    image_composition = ManagedImageComposition(device)
 
     # Load font for clock
     FontTime = ImageFont.truetype(
@@ -1756,6 +1820,28 @@ async def main():
     fetch_task = asyncio.create_task(fetch_data_periodically(board))
 
     # === New Frame Timing Setup ===
+    max_fps = 30  # Highest refresh rate we'll aim for during normal operation
+    min_fps = 10  # Allow the loop to back off when work routinely exceeds the budget
+    fps_step = 5  # Number of frames to shave off/on when adapting
+    overrun_window = 5.0  # Seconds of consecutive overruns before we scale down
+    recovery_window = 120.0  # Seconds of stable frames before we scale back up
+    min_frame_sleep = 0.001  # Always yield to the loop for at least 1 ms
+
+    current_fps = max_fps
+    frame_time = 1 / current_fps
+    overrun_frames = 0
+    stable_frames = 0
+
+    def _overrun_threshold(fps: int) -> int:
+        return max(int(overrun_window * fps), fps)
+
+    def _recovery_threshold(fps: int) -> int:
+        return max(int(recovery_window * fps), fps)
+
+    overrun_threshold = _overrun_threshold(current_fps)
+    recovery_threshold = _recovery_threshold(current_fps)
+
+    loop = asyncio.get_running_loop()
     target_fps = 30  # Set target FPS
     frame_time = 1 / target_fps  # Target time per frame
     min_frame_sleep = 0.001  # Always yield to the loop for at least 1ms
@@ -1763,7 +1849,7 @@ async def main():
 
     try:
         while True:
-            start_time = asyncio.get_event_loop().time()  # Time before execution
+            start_time = loop.time()  # Time before execution
 
             # Handle energy saver mode
             if Args.EnergySaverMode != "none" and is_time_between():
@@ -1808,11 +1894,28 @@ async def main():
                 )
 
             # === New Dynamic Timing Mechanism ===
+            elapsed_time = loop.time() - start_time
             elapsed_time = asyncio.get_event_loop().time() - start_time
             sleep_time = frame_time - elapsed_time
 
             if sleep_time <= 0:
                 overrun_frames += 1
+                stable_frames = 0
+
+                if current_fps > min_fps and overrun_frames >= overrun_threshold:
+                    current_fps = max(current_fps - fps_step, min_fps)
+                    frame_time = 1 / current_fps
+                    overrun_threshold = _overrun_threshold(current_fps)
+                    recovery_threshold = _recovery_threshold(current_fps)
+                    print(
+                        f"Render loop load is sustained; reducing target FPS to {current_fps} to restore slack."
+                    )
+                    overrun_frames = 0
+                elif current_fps == min_fps:
+                    if overrun_frames == 1 or overrun_frames % (current_fps * 60) == 0:
+                        print(
+                            "Render loop remains over budget even at minimum FPS; consider lowering animations or scroll speed."
+                        )
                 # Emit an occasional warning so long-running drift is visible
                 if overrun_frames == 1 or overrun_frames % (target_fps * 60) == 0:
                     print(
@@ -1822,6 +1925,18 @@ async def main():
             else:
                 if overrun_frames:
                     overrun_frames = 0
+                stable_frames += 1
+                sleep_time = max(sleep_time, min_frame_sleep)
+
+                if current_fps < max_fps and stable_frames >= recovery_threshold:
+                    current_fps = min(current_fps + fps_step, max_fps)
+                    frame_time = 1 / current_fps
+                    overrun_threshold = _overrun_threshold(current_fps)
+                    recovery_threshold = _recovery_threshold(current_fps)
+                    print(
+                        f"Render loop has been stable; increasing target FPS to {current_fps}."
+                    )
+                    stable_frames = 0
                 sleep_time = max(sleep_time, min_frame_sleep)
 
             await asyncio.sleep(sleep_time)
