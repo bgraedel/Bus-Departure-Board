@@ -1842,6 +1842,10 @@ async def main():
     recovery_threshold = _recovery_threshold(current_fps)
 
     loop = asyncio.get_running_loop()
+    target_fps = 30  # Set target FPS
+    frame_time = 1 / target_fps  # Target time per frame
+    min_frame_sleep = 0.001  # Always yield to the loop for at least 1ms
+    overrun_frames = 0  # Track consecutive frames that run long
 
     try:
         while True:
@@ -1891,6 +1895,7 @@ async def main():
 
             # === New Dynamic Timing Mechanism ===
             elapsed_time = loop.time() - start_time
+            elapsed_time = asyncio.get_event_loop().time() - start_time
             sleep_time = frame_time - elapsed_time
 
             if sleep_time <= 0:
@@ -1911,6 +1916,11 @@ async def main():
                         print(
                             "Render loop remains over budget even at minimum FPS; consider lowering animations or scroll speed."
                         )
+                # Emit an occasional warning so long-running drift is visible
+                if overrun_frames == 1 or overrun_frames % (target_fps * 60) == 0:
+                    print(
+                        "Render loop is running behind; CPU usage may climb if this persists."
+                    )
                 sleep_time = min_frame_sleep
             else:
                 if overrun_frames:
@@ -1927,6 +1937,7 @@ async def main():
                         f"Render loop has been stable; increasing target FPS to {current_fps}."
                     )
                     stable_frames = 0
+                sleep_time = max(sleep_time, min_frame_sleep)
 
             await asyncio.sleep(sleep_time)
 
