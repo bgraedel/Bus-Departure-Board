@@ -36,7 +36,6 @@ import logging
 
 # Used to get live data from the Transport API and represent a specific services and it's details.
 import asyncio
-from datetime import datetime
 from requests.exceptions import RequestException, ConnectionError as RequestsConnectionError
 
 
@@ -290,12 +289,6 @@ _BUS_ICON_BASE = Image.open(BUS_ICON_PATH).convert("RGBA")
 BUS_ICON_16 = _BUS_ICON_BASE.resize((16, 16), Image.LANCZOS)
 BUS_ICON_12 = _BUS_ICON_BASE.resize((12, 12), Image.LANCZOS)
 _BUS_ICON_BASE.close()
-
-if Args.LargeLineName and Args.ShowIndex:
-    print(
-        "You can not have both '--ExtraLargeLineName' and '--ShowIndex' turned on at the same time."
-    )
-    sys.exit()
 
 if Args.LargeLineName and Args.ShowIndex:
     print(
@@ -1828,6 +1821,7 @@ async def main():
     min_frame_sleep = 0.001  # Always yield to the loop for at least 1 ms
 
     current_fps = max_fps
+    target_fps = max_fps  # Baseline FPS used for informational logging cadence
     frame_time = 1 / current_fps
     overrun_frames = 0
     stable_frames = 0
@@ -1842,10 +1836,6 @@ async def main():
     recovery_threshold = _recovery_threshold(current_fps)
 
     loop = asyncio.get_running_loop()
-    target_fps = 30  # Set target FPS
-    frame_time = 1 / target_fps  # Target time per frame
-    min_frame_sleep = 0.001  # Always yield to the loop for at least 1ms
-    overrun_frames = 0  # Track consecutive frames that run long
 
     try:
         while True:
@@ -1895,7 +1885,6 @@ async def main():
 
             # === New Dynamic Timing Mechanism ===
             elapsed_time = loop.time() - start_time
-            elapsed_time = asyncio.get_event_loop().time() - start_time
             sleep_time = frame_time - elapsed_time
 
             if sleep_time <= 0:
