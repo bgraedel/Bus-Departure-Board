@@ -1648,8 +1648,23 @@ class boardFixed:
             #     f"Force rotating to services {middle_service.ServiceNumber} and {bottom_service.ServiceNumber}"
             # )
             async with self.display_lock:
-                self.middle.changeCard(middle_service)
-                self.bottom.changeCard(bottom_service)
+                if (
+                    self.middle
+                    and self.middle.CurrentService
+                    and self.middle.CurrentService.ID == middle_service.ID
+                ):
+                    self.middle.refresh()
+                else:
+                    self.middle.changeCard(middle_service)
+
+                if (
+                    self.bottom
+                    and self.bottom.CurrentService
+                    and self.bottom.CurrentService.ID == bottom_service.ID
+                ):
+                    self.bottom.refresh()
+                else:
+                    self.bottom.changeCard(bottom_service)
 
     async def requestCardChange(self, card, row):
         """
@@ -1699,8 +1714,25 @@ class boardFixed:
                         idx_middle = self.rotating_index % len(rotating)
                         idx_bottom = (self.rotating_index + 1) % len(rotating)
                         # Update both rows
-                        self.middle.changeCard(rotating[idx_middle])
-                        self.bottom.changeCard(rotating[idx_bottom])
+                        middle_service = rotating[idx_middle]
+                        bottom_service = rotating[idx_bottom]
+
+                        if (
+                            self.middle.CurrentService
+                            and self.middle.CurrentService.ID == middle_service.ID
+                        ):
+                            self.middle.refresh()
+                        else:
+                            self.middle.changeCard(middle_service)
+
+                        if (
+                            self.bottom.CurrentService
+                            and self.bottom.CurrentService.ID == bottom_service.ID
+                        ):
+                            self.bottom.refresh()
+                        else:
+                            self.bottom.changeCard(bottom_service)
+
                         # Increment rotating_index to show next set of services in the next cycle
                         self.rotating_index = (self.rotating_index + 1) % len(rotating)
                         # Debug output to verify cycling
